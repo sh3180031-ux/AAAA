@@ -1,4 +1,4 @@
-name: .github/workflows/download.yml
+name:github/workflows/download.yml
 
 # Triggered by the HTML dashboard via a repository_dispatch POST to
 # /repos/{owner}/{repo}/dispatches with event_type: "download"
