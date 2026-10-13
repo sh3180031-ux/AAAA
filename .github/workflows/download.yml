@@ -35,29 +35,30 @@ jobs:
       - name: Install yt-dlp
         if: github.event.client_payload.mode == 'video'
         run: |
-          python3 -m pip install --upgrade "yt-dlp[default]"
-
-      - name: Write cookies file (optional)
-        if: github.event.client_payload.mode == 'video' && env.YT_COOKIES != ''
-        env:
-          YT_COOKIES: ${{ secrets.YT_COOKIES }}
-        run: echo "$YT_COOKIES" > cookies.txt
+          python3 -m pip install --upgrade --pre "yt-dlp[default,curl-cffi]"
+          yt-dlp --version
 
       - name: Download video
         if: github.event.client_payload.mode == 'video'
         env:
           URL: ${{ github.event.client_payload.url }}
           QUALITY: ${{ github.event.client_payload.quality }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          DL_PROXY: ${{ secrets.DL_PROXY }}
         run: |
-          set -e
-          COOKIE_ARGS=""
-          if [ -f cookies.txt ]; then
-            COOKIE_ARGS="--cookies cookies.txt"
+          COMMON=(--retries 5 --extractor-retries 3 --fragment-retries 5
+                  --remote-components ejs:github --js-runtimes node)
+
+          if [ -n "$YT_COOKIES" ]; then
+            echo "$YT_COOKIES" > cookies.txt
+            COMMON+=(--cookies cookies.txt)
+          fi
+          if [ -n "$DL_PROXY" ]; then
+            COMMON+=(--proxy "$DL_PROXY")
           fi
 
           if [ "$QUALITY" = "audio" ]; then
-            yt-dlp --ignore-errors $COOKIE_ARGS --remote-components ejs:github --js-runtimes node -x --audio-format mp3 \
-              -o "out/%(title)s.%(ext)s" "$URL"
+            MODE=(-x --audio-format mp3)
           else
             case "$QUALITY" in
               1080) FMT="bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
@@ -65,9 +66,19 @@ jobs:
               480)  FMT="bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
               *)    FMT="bestvideo+bestaudio/best" ;;
             esac
-            yt-dlp --ignore-errors $COOKIE_ARGS --remote-components ejs:github --js-runtimes node -f "$FMT" --merge-output-format mp4 \
-              -o "out/%(title)s.%(ext)s" "$URL"
+            MODE=(-f "$FMT" --merge-output-format mp4)
           fi
+
+          OUT=(-o "out/%(title)s.%(ext)s")
+
+          echo "== Attempt 1: default =="
+          if yt-dlp "${COMMON[@]}" "${MODE[@]}" "${OUT[@]}" "$URL"; then exit 0; fi
+
+          echo "== Attempt 2: impersonate chrome =="
+          if yt-dlp "${COMMON[@]}" --impersonate chrome "${MODE[@]}" "${OUT[@]}" "$URL"; then exit 0; fi
+
+          echo "== Attempt 3: simplest format =="
+          yt-dlp "${COMMON[@]}" --impersonate chrome -f "best" "${OUT[@]}" "$URL"
 
       # ---------- FILE MODE (plain curl, no yt-dlp involved) ----------
       - name: Download file
