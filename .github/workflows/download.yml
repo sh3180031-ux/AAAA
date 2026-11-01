@@ -6,6 +6,10 @@ on:
   repository_dispatch:
     types: [download]
 
+# Needed so the job can push the result to the "downloads" branch.
+permissions:
+  contents: write
+
 # run-name MUST match what the dashboard's findRun() looks for:
 # target = 'dl-' + requestId  (checked against display_title / name)
 run-name: dl-${{ github.event.client_payload.request_id }}
@@ -15,6 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Show request
         run: |
           echo "mode=${{ github.event.client_payload.mode }}"
@@ -93,6 +100,41 @@ jobs:
       - name: List result
         run: ls -la out
 
+      # ---------- NEW: publish to the "downloads" branch (CORS-safe) ----------
+      # The dashboard reads these files via the git blobs API, which does
+      # send CORS headers, so no browser blocking. Works for files up to
+      # ~100MB. Larger files won't commit — use the artifact backup instead.
+      - name: Publish to downloads branch
+        env:
+          REQ: ${{ github.event.client_payload.request_id }}
+        run: |
+          set -e
+          # size guard: skip anything over 95MB (git blobs API limit is 100MB)
+          if find out -type f -size +95M | grep -q .; then
+            echo "A file is larger than 95MB; skipping branch publish. Use the artifact backup."
+            exit 0
+          fi
+
+          cp -r out /tmp/dl_out
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code origin downloads >/dev/null 2>&1; then
+            git fetch origin downloads
+            git checkout -B downloads origin/downloads
+          else
+            git checkout --orphan downloads
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          rm -rf "dl-$REQ"
+          mkdir -p "dl-$REQ"
+          cp /tmp/dl_out/* "dl-$REQ/"
+          git add "dl-$REQ"
+          git commit -m "download $REQ" || echo "nothing to commit"
+          git push origin downloads
+
+      # ---------- backup: keep the artifact too (for the GitHub-website link) ----------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
