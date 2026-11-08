@@ -152,8 +152,32 @@ jobs:
           done
           # הענף המשותף מהגרסה הקודמת כבר לא בשימוש
           gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/downloads" >/dev/null 2>&1 || true
+          # מחיקת releases ישנים של הורדות
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 300 --json tagName,createdAt \
+            --jq '.[] | select(.tagName|startswith("rel-")) | .tagName + " " + .createdAt' | while read -r TAG C; do
+            if [ "$(date -d "$C" +%s)" -lt "$CUTOFF" ]; then
+              gh release delete "$TAG" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" && echo "deleted release $TAG"
+            fi
+          done
 
-      # ---------- פרסום לענף פרטי dl-<id>, קבצים גדולים מחולקים לחלקים של 90MB ----------
+      # ---------- קובץ שלם אחד להורדה ישירה (Release, עד 2GB לקובץ) ----------
+      - name: Publish as release (one whole file)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          FILES=()
+          for f in out/*; do
+            [ -f "$f" ] || continue
+            if [ "$(stat -c%s "$f")" -lt 2147000000 ]; then FILES+=("$f"); fi
+          done
+          if [ ${#FILES[@]} -eq 0 ]; then echo "nothing fits in a release"; exit 0; fi
+          gh release create "rel-$REQ" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" \
+            --title "rel-$REQ" --notes "auto download" --latest=false
+          echo "release created"
+
+      # ---------- פרסום לענף פרטי dl-<id>, קבצים מחולקים לחלקים של 25MB ----------
       # הדשבורד מוריד את החלקים דרך ה-API (בלי בעיות CORS) ומחבר אותם חזרה לקובץ אחד.
       - name: Publish to download branch
         id: pub
@@ -171,7 +195,7 @@ jobs:
           python3 - "$GITHUB_WORKSPACE/out" "$PUB" << 'PY'
           import os, sys, json
           src, dst = sys.argv[1], sys.argv[2]
-          CHUNK = 90 * 1024 * 1024
+          CHUNK = 25 * 1024 * 1024
           files = []
           for i, name in enumerate(sorted(os.listdir(src))):
               path = os.path.join(src, name)
@@ -222,7 +246,7 @@ jobs:
           for f in $(ls *.part | sort); do
             git add "$f"
             SIZE=$((SIZE + $(stat -c%s "$f")))
-            if [ "$SIZE" -ge 943718400 ]; then push_batch; SIZE=0; fi
+            if [ "$SIZE" -ge 838860800 ]; then push_batch; SIZE=0; fi
           done
           # ה-manifest נכנס אחרון = סימן שהכל מוכן
           git add manifest.json
