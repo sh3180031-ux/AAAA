@@ -6,7 +6,8 @@ on:
     types: [download]
 
 permissions:
-  contents: write
+  contents: read
+  actions: read
 
 # מכריח את כל ה-actions לרוץ על Node 24 (מעלים את אזהרת Node 20)
 env:
@@ -19,38 +20,19 @@ jobs:
   fetch:
     # גרסה קבועה במקום ubuntu-latest, כדי שהמעבר לאובונטו 26 לא ישבור כלום
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 120
     env:
       MODE: ${{ github.event.client_payload.mode }}
       URL: ${{ github.event.client_payload.url }}
       QUALITY: ${{ github.event.client_payload.quality }}
       REQ: ${{ github.event.client_payload.request_id }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 1
-
       - name: Show request
         run: |
           echo "mode=$MODE"
           echo "url=$URL"
           echo "quality=$QUALITY"
           mkdir -p out
-
-      # ---------- כלים ----------
-      - name: Install ffmpeg (only if missing)
-        run: |
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends ffmpeg
-          fi
-          ffmpeg -version | head -1
-
-      - name: Install yt-dlp
-        run: |
-          python3 -m pip install --quiet --upgrade --pre "yt-dlp[default,curl-cffi]"
-          yt-dlp --version
 
       # ---------- הורדה ----------
       - name: Download
@@ -61,8 +43,26 @@ jobs:
           set +e
           COOKIE_FILE="$RUNNER_TEMP/cookies.txt"
 
+          # ---- התקנה מהירה של הכלים, רק כשצריך ----
+          tools_ready=0
+          install_tools () {
+            [ "$tools_ready" = 1 ] && return 0
+            echo "== installing yt-dlp + ffmpeg =="
+            python3 -m pip install --quiet --upgrade --pre "yt-dlp[default,curl-cffi]" &
+            PIP=$!
+            if ! command -v ffmpeg >/dev/null 2>&1; then
+              # ffmpeg סטטי מוכן (כ-10 שניות) במקום apt-get (כדקה)
+              curl -fsSL https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+                | sudo tar -xJ --strip-components=2 -C /usr/local/bin --wildcards '*/bin/ffmpeg' '*/bin/ffprobe' \
+                || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg; }
+            fi
+            wait $PIP
+            yt-dlp --version && tools_ready=1
+          }
+
           # ---- פונקציה: הורדה עם yt-dlp (וידאו מכל אתר שנתמך) ----
           ytdlp_download () {
+            install_tools || return 1
             COMMON=(--no-playlist --retries 10 --extractor-retries 5 --fragment-retries 10
                     --concurrent-fragments 8 --trim-filenames 150 --no-mtime
                     --remote-components ejs:github --js-runtimes node)
@@ -136,132 +136,12 @@ jobs:
           ls -la out
           if [ -z "$(ls -A out)" ]; then echo "::error::No file was downloaded"; exit 1; fi
 
-      # ---------- ניקוי ענפי הורדה ישנים (מעל יממה) ----------
-      - name: Clean old download branches
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          CUTOFF=$(date -d '-1 day' +%s)
-          gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/dl-" --paginate \
-            --jq '.[] | .ref + " " + .object.sha' | while read -r REF SHA; do
-            D=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$SHA" --jq .committer.date)
-            if [ "$(date -d "$D" +%s)" -lt "$CUTOFF" ]; then
-              gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/$REF" >/dev/null && echo "deleted $REF"
-            fi
-          done
-          # הענף המשותף מהגרסה הקודמת כבר לא בשימוש
-          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/downloads" >/dev/null 2>&1 || true
-          # מחיקת releases ישנים של הורדות
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 300 --json tagName,createdAt \
-            --jq '.[] | select(.tagName|startswith("rel-")) | .tagName + " " + .createdAt' | while read -r TAG C; do
-            if [ "$(date -d "$C" +%s)" -lt "$CUTOFF" ]; then
-              gh release delete "$TAG" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" && echo "deleted release $TAG"
-            fi
-          done
-
-      # ---------- קובץ שלם אחד להורדה ישירה (Release, עד 2GB לקובץ) ----------
-      - name: Publish as release (one whole file)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -e
-          FILES=()
-          for f in out/*; do
-            [ -f "$f" ] || continue
-            if [ "$(stat -c%s "$f")" -lt 2147000000 ]; then FILES+=("$f"); fi
-          done
-          if [ ${#FILES[@]} -eq 0 ]; then echo "nothing fits in a release"; exit 0; fi
-          gh release create "rel-$REQ" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" \
-            --title "rel-$REQ" --notes "auto download" --latest=false
-          echo "release created"
-
-      # ---------- פרסום לענף פרטי dl-<id>, קבצים מחולקים לחלקים של 25MB ----------
-      # הדשבורד מוריד את החלקים דרך ה-API (בלי בעיות CORS) ומחבר אותם חזרה לקובץ אחד.
-      - name: Publish to download branch
-        id: pub
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -e
-          BR="dl-$REQ"
-          PUB="$RUNNER_TEMP/pub"
-          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          rm -rf "$PUB" && mkdir -p "$PUB"
-
-          # חלוקה לחלקים + manifest.json עם השמות המקוריים
-          python3 - "$GITHUB_WORKSPACE/out" "$PUB" << 'PY'
-          import os, sys, json
-          src, dst = sys.argv[1], sys.argv[2]
-          CHUNK = 25 * 1024 * 1024
-          files = []
-          for i, name in enumerate(sorted(os.listdir(src))):
-              path = os.path.join(src, name)
-              if not os.path.isfile(path):
-                  continue
-              size = os.path.getsize(path)
-              parts = []
-              with open(path, 'rb') as f:
-                  n = 0
-                  while True:
-                      buf = f.read(CHUNK)
-                      if not buf and n > 0:
-                          break
-                      pname = f"{i:03d}_{n:04d}.part"
-                      with open(os.path.join(dst, pname), 'wb') as o:
-                          o.write(buf)
-                      parts.append(pname)
-                      n += 1
-                      if not buf:
-                          break
-              os.remove(path)  # חוסך מקום בדיסק של ה-runner
-              files.append({"name": name, "size": size, "parts": parts})
-          json.dump({"files": files}, open(os.path.join(dst, "manifest.json"), "w"), ensure_ascii=False)
-          print(json.dumps(files, ensure_ascii=False, indent=1))
-          PY
-
-          cd "$PUB"
-          git init -q
-          git checkout -q -b "$BR"
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config http.postBuffer 1048576000
-          git remote add origin "$REMOTE"
-
-          FIRST=1
-          push_batch () {
-            git commit -qm "$BR" || return 0
-            for t in 1 2 3 4 5; do
-              if [ "$FIRST" = 1 ]; then git push -q -f origin "$BR" && { FIRST=0; return 0; }
-              else git push -q origin "$BR" && return 0; fi
-              echo "push failed, retry $t"; sleep $((t * 5))
-            done
-            return 1
-          }
-
-          # דוחף במנות של ~900MB (GitHub מגביל דחיפה בודדת ל-2GB)
-          SIZE=0
-          for f in $(ls *.part | sort); do
-            git add "$f"
-            SIZE=$((SIZE + $(stat -c%s "$f")))
-            if [ "$SIZE" -ge 838860800 ]; then push_batch; SIZE=0; fi
-          done
-          # ה-manifest נכנס אחרון = סימן שהכל מוכן
-          git add manifest.json
-          push_batch
-          echo "published to branch $BR"
-
-      # ---------- גיבוי: artifact, רק אם הפרסום לענף נכשל ----------
-      - name: Upload artifact (fallback)
-        if: steps.pub.outcome != 'success'
+      # ---------- העלאה כ-artifact (הכי מהיר; בלי דחיסה) ----------
+      - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: result-${{ github.event.client_payload.request_id }}
-          path: |
-            out/*
-            ${{ runner.temp }}/pub/*
+          path: out/*
           retention-days: 1
           if-no-files-found: error
           compression-level: 0
