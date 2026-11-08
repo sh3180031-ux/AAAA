@@ -132,9 +132,28 @@ jobs:
           ls -la out
           if [ -z "$(ls -A out)" ]; then echo "::error::No file was downloaded"; exit 1; fi
 
-      # ---------- העלאה כ-artifact (בלי דחיסה = מהיר יותר) ----------
-      - name: Upload artifact
-        uses: actions/upload-artifact@v6
+      # ---------- בדיקה כמה קבצים ירדו ----------
+      - name: Pick file
+        id: pick
+        run: |
+          COUNT=$(find out -maxdepth 1 -type f | wc -l)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "file=$(find out -maxdepth 1 -type f | head -1)" >> "$GITHUB_OUTPUT"
+
+      # ---------- קובץ אחד: מועלה כמו שהוא, בלי ZIP ----------
+      - name: Upload file (no zip)
+        if: steps.pick.outputs.count == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.pick.outputs.file }}
+          archive: false
+          retention-days: 1
+          if-no-files-found: error
+
+      # ---------- כמה קבצים: נשאר ZIP (אין ברירה) ----------
+      - name: Upload files (zip)
+        if: steps.pick.outputs.count != '1'
+        uses: actions/upload-artifact@v7
         with:
           name: result-${{ github.event.client_payload.request_id }}
           path: out/*
