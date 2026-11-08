@@ -1,176 +1,91 @@
 name: download
 
-# מופעל מהדשבורד (proxy-downloader.html) דרך repository_dispatch עם event_type: "download"
+# Triggered by the HTML dashboard via a repository_dispatch POST to
+# /repos/{owner}/{repo}/dispatches with event_type: "download"
 on:
   repository_dispatch:
     types: [download]
 
-# מכריח את כל ה-actions לרוץ על Node 24 (מעלים את אזהרת Node 20)
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
-# חייב להתאים ל-findRun() בדשבורד
+# run-name MUST match what the dashboard's findRun() looks for:
+# target = 'dl-' + requestId  (checked against display_title / name)
 run-name: dl-${{ github.event.client_payload.request_id }}
 
 jobs:
   fetch:
-    # גרסה קבועה במקום ubuntu-latest, כדי שהמעבר לאובונטו 26 לא ישבור כלום
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      MODE: ${{ github.event.client_payload.mode }}
-      URL: ${{ github.event.client_payload.url }}
-      QUALITY: ${{ github.event.client_payload.quality }}
-      REQ: ${{ github.event.client_payload.request_id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Show request
         run: |
-          echo "mode=$MODE"
-          echo "url=$URL"
-          echo "quality=$QUALITY"
-          mkdir -p out
+          echo "mode=${{ github.event.client_payload.mode }}"
+          echo "url=${{ github.event.client_payload.url }}"
+          echo "quality=${{ github.event.client_payload.quality }}"
 
-      # ---------- הורדה ----------
-      - name: Download
+      - name: Prepare output dir
+        run: mkdir -p out
+
+      # ---------- VIDEO MODE (yt-dlp) ----------
+      - name: Install ffmpeg
+        if: github.event.client_payload.mode == 'video'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version
+
+      - name: Install yt-dlp
+        if: github.event.client_payload.mode == 'video'
+        run: |
+          python3 -m pip install --upgrade "yt-dlp[default]"
+
+      - name: Write cookies file (optional)
+        if: github.event.client_payload.mode == 'video' && env.YT_COOKIES != ''
         env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
-          DL_PROXY: ${{ secrets.DL_PROXY }}
+        run: echo "$YT_COOKIES" > cookies.txt
+
+      - name: Download video
+        if: github.event.client_payload.mode == 'video'
+        env:
+          URL: ${{ github.event.client_payload.url }}
+          QUALITY: ${{ github.event.client_payload.quality }}
         run: |
-          set +e
-          COOKIE_FILE="$RUNNER_TEMP/cookies.txt"
-
-          # ---- התקנה מהירה של הכלים, רק כשצריך ----
-          tools_ready=0
-          install_tools () {
-            [ "$tools_ready" = 1 ] && return 0
-            echo "== installing yt-dlp + ffmpeg =="
-            python3 -m pip install --quiet --upgrade --pre "yt-dlp[default,curl-cffi]" &
-            PIP=$!
-            if ! command -v ffmpeg >/dev/null 2>&1; then
-              # ffmpeg סטטי מוכן (כ-10 שניות) במקום apt-get (כדקה)
-              curl -fsSL https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
-                | sudo tar -xJ --strip-components=2 -C /usr/local/bin --wildcards '*/bin/ffmpeg' '*/bin/ffprobe' \
-                || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg; }
-            fi
-            wait $PIP
-            yt-dlp --version && tools_ready=1
-          }
-
-          # ---- פונקציה: הורדה עם yt-dlp (וידאו מכל אתר שנתמך) ----
-          ytdlp_download () {
-            install_tools || return 1
-            COMMON=(--no-playlist --retries 10 --extractor-retries 5 --fragment-retries 10
-                    --concurrent-fragments 8 --trim-filenames 150 --no-mtime
-                    --remote-components ejs:github --js-runtimes node)
-            if [ -n "$YT_COOKIES" ]; then
-              printf '%s\n' "$YT_COOKIES" > "$COOKIE_FILE"
-              COMMON+=(--cookies "$COOKIE_FILE")
-            fi
-            if [ -n "$DL_PROXY" ]; then
-              COMMON+=(--proxy "$DL_PROXY")
-            fi
-
-            if [ "$QUALITY" = "audio" ]; then
-              FMTARGS=(-f "bestaudio/best" -x --audio-format mp3 --audio-quality 0)
-            else
-              case "$QUALITY" in
-                1080) FMT="bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b" ;;
-                720)  FMT="bv*[height<=720]+ba/b[height<=720]/bv*+ba/b" ;;
-                480)  FMT="bv*[height<=480]+ba/b[height<=480]/bv*+ba/b" ;;
-                *)    FMT="bv*+ba/b" ;;
-              esac
-              FMTARGS=(-f "$FMT" --merge-output-format mp4)
-            fi
-            OUT=(-o "out/%(title).120B [%(id)s].%(ext)s")
-
-            echo "== Attempt 1: default =="
-            yt-dlp "${COMMON[@]}" "${FMTARGS[@]}" "${OUT[@]}" "$URL" && return 0
-            rm -f out/*.part out/*.ytdl
-
-            echo "== Attempt 2: impersonate chrome =="
-            yt-dlp "${COMMON[@]}" --impersonate chrome "${FMTARGS[@]}" "${OUT[@]}" "$URL" && return 0
-            rm -f out/*.part out/*.ytdl
-
-            echo "== Attempt 3: other YouTube clients =="
-            yt-dlp "${COMMON[@]}" --impersonate chrome \
-              --extractor-args "youtube:player_client=default,tv,web_safari,mweb" \
-              "${FMTARGS[@]}" "${OUT[@]}" "$URL" && return 0
-            rm -f out/*.part out/*.ytdl
-
-            echo "== Attempt 4: simplest single file =="
-            yt-dlp "${COMMON[@]}" --impersonate chrome -f "b/best" "${OUT[@]}" "$URL" && return 0
-            return 1
-          }
-
-          # ---- פונקציה: הורדת קובץ ישיר עם curl ----
-          curl_download () {
-            UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
-            ( cd out && curl -fL --retry 5 --retry-delay 3 --retry-all-errors \
-                -A "$UA" -O -J "$URL" ) && return 0
-            rm -f out/*
-            ( cd out && curl -fL --retry 5 --retry-delay 3 --retry-all-errors \
-                -A "$UA" -o "downloaded_file" "$URL" ) && return 0
-            rm -f out/*
-            return 1
-          }
-
-          # ---- Google Drive: הורדה ישירה דרך הקישור הרשמי של גוגל ----
-          if echo "$URL" | grep -qE '(drive|docs)\.google\.com'; then
-            ID=$(echo "$URL" | sed -nE 's#.*[?&]id=([A-Za-z0-9_-]+).*#\1#p')
-            [ -z "$ID" ] && ID=$(echo "$URL" | sed -nE 's#.*/d/([A-Za-z0-9_-]+).*#\1#p')
-            if [ -n "$ID" ]; then
-              echo "== Google Drive file id: $ID =="
-              DURL="https://drive.usercontent.google.com/download?id=${ID}&export=download&confirm=t"
-              ( cd out && curl -fL --retry 5 --retry-delay 3 --retry-all-errors -O -J "$DURL" ) && exit 0
-              rm -f out/*
-              echo "::error::Google Drive refused the file (404/403). Make sure the file is shared as 'Anyone with the link'."
-              exit 1
-            fi
+          set -e
+          COOKIE_ARGS=""
+          if [ -f cookies.txt ]; then
+            COOKIE_ARGS="--cookies cookies.txt"
           fi
 
-          if [ "$MODE" = "file" ]; then
-            curl_download && exit 0
-            echo "curl failed -> trying yt-dlp as fallback"
-            ytdlp_download && exit 0
+          if [ "$QUALITY" = "audio" ]; then
+            yt-dlp --ignore-errors $COOKIE_ARGS --remote-components ejs:github --js-runtimes node -x --audio-format mp3 \
+              -o "out/%(title)s.%(ext)s" "$URL"
           else
-            ytdlp_download && exit 0
-            echo "yt-dlp failed -> trying plain curl as fallback"
-            curl_download && exit 0
+            case "$QUALITY" in
+              1080) FMT="bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
+              720)  FMT="bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
+              480)  FMT="bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
+              *)    FMT="bestvideo+bestaudio/best" ;;
+            esac
+            yt-dlp --ignore-errors $COOKIE_ARGS --remote-components ejs:github --js-runtimes node -f "$FMT" --merge-output-format mp4 \
+              -o "out/%(title)s.%(ext)s" "$URL"
           fi
-          echo "::error::All download attempts failed"
-          exit 1
+
+      # ---------- FILE MODE (plain curl, no yt-dlp involved) ----------
+      - name: Download file
+        if: github.event.client_payload.mode == 'file'
+        env:
+          URL: ${{ github.event.client_payload.url }}
+        run: |
+          set -e
+          cd out
+          curl -L -O -J "$URL" || curl -L -o downloaded_file "$URL"
 
       - name: List result
-        run: |
-          rm -f out/*.part out/*.ytdl
-          ls -la out
-          if [ -z "$(ls -A out)" ]; then echo "::error::No file was downloaded"; exit 1; fi
+        run: ls -la out
 
-      # ---------- בדיקה כמה קבצים ירדו ----------
-      - name: Pick file
-        id: pick
-        run: |
-          COUNT=$(find out -maxdepth 1 -type f | wc -l)
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "file=$(find out -maxdepth 1 -type f | head -1)" >> "$GITHUB_OUTPUT"
-
-      # ---------- קובץ אחד: מועלה כמו שהוא, בלי ZIP ----------
-      - name: Upload file (no zip)
-        if: steps.pick.outputs.count == '1'
-        uses: actions/upload-artifact@v7
-        with:
-          path: ${{ steps.pick.outputs.file }}
-          archive: false
-          retention-days: 1
-          if-no-files-found: error
-
-      # ---------- כמה קבצים: נשאר ZIP (אין ברירה) ----------
-      - name: Upload files (zip)
-        if: steps.pick.outputs.count != '1'
-        uses: actions/upload-artifact@v7
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
           name: result-${{ github.event.client_payload.request_id }}
           path: out/*
           retention-days: 1
           if-no-files-found: error
-          compression-level: 0
