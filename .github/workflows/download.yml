@@ -1,144 +1,191 @@
 name: download
 
-# Triggered by the HTML dashboard via a repository_dispatch POST to
-# /repos/{owner}/{repo}/dispatches with event_type: "download"
+# מופעל מהדשבורד (proxy-downloader.html) דרך repository_dispatch עם event_type: "download"
 on:
   repository_dispatch:
     types: [download]
 
-# Needed so the job can push the result to the "downloads" branch.
 permissions:
   contents: write
 
-# run-name MUST match what the dashboard's findRun() looks for:
-# target = 'dl-' + requestId  (checked against display_title / name)
+# מכריח את כל ה-actions לרוץ על Node 24 (מעלים את אזהרת Node 20)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# חייב להתאים ל-findRun() בדשבורד
 run-name: dl-${{ github.event.client_payload.request_id }}
 
 jobs:
   fetch:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # גרסה קבועה במקום ubuntu-latest, כדי שהמעבר לאובונטו 26 לא ישבור כלום
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MODE: ${{ github.event.client_payload.mode }}
+      URL: ${{ github.event.client_payload.url }}
+      QUALITY: ${{ github.event.client_payload.quality }}
+      REQ: ${{ github.event.client_payload.request_id }}
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
 
       - name: Show request
         run: |
-          echo "mode=${{ github.event.client_payload.mode }}"
-          echo "url=${{ github.event.client_payload.url }}"
-          echo "quality=${{ github.event.client_payload.quality }}"
+          echo "mode=$MODE"
+          echo "url=$URL"
+          echo "quality=$QUALITY"
+          mkdir -p out
 
-      - name: Prepare output dir
-        run: mkdir -p out
-
-      # ---------- VIDEO MODE (yt-dlp) ----------
-      - name: Install ffmpeg
-        if: github.event.client_payload.mode == 'video'
+      # ---------- כלים ----------
+      - name: Install ffmpeg (only if missing)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-          ffmpeg -version
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends ffmpeg
+          fi
+          ffmpeg -version | head -1
 
       - name: Install yt-dlp
-        if: github.event.client_payload.mode == 'video'
         run: |
-          python3 -m pip install --upgrade --pre "yt-dlp[default,curl-cffi]"
+          python3 -m pip install --quiet --upgrade --pre "yt-dlp[default,curl-cffi]"
           yt-dlp --version
 
-      - name: Download video
-        if: github.event.client_payload.mode == 'video'
+      # ---------- הורדה ----------
+      - name: Download
         env:
-          URL: ${{ github.event.client_payload.url }}
-          QUALITY: ${{ github.event.client_payload.quality }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           DL_PROXY: ${{ secrets.DL_PROXY }}
         run: |
-          COMMON=(--retries 5 --extractor-retries 3 --fragment-retries 5
-                  --remote-components ejs:github --js-runtimes node)
+          set +e
+          COOKIE_FILE="$RUNNER_TEMP/cookies.txt"
 
-          if [ -n "$YT_COOKIES" ]; then
-            echo "$YT_COOKIES" > cookies.txt
-            COMMON+=(--cookies cookies.txt)
-          fi
-          if [ -n "$DL_PROXY" ]; then
-            COMMON+=(--proxy "$DL_PROXY")
-          fi
+          # ---- פונקציה: הורדה עם yt-dlp (וידאו מכל אתר שנתמך) ----
+          ytdlp_download () {
+            COMMON=(--no-playlist --retries 10 --extractor-retries 5 --fragment-retries 10
+                    --concurrent-fragments 8 --trim-filenames 150 --no-mtime
+                    --remote-components ejs:github --js-runtimes node)
+            if [ -n "$YT_COOKIES" ]; then
+              printf '%s\n' "$YT_COOKIES" > "$COOKIE_FILE"
+              COMMON+=(--cookies "$COOKIE_FILE")
+            fi
+            if [ -n "$DL_PROXY" ]; then
+              COMMON+=(--proxy "$DL_PROXY")
+            fi
 
-          if [ "$QUALITY" = "audio" ]; then
-            MODE=(-x --audio-format mp3)
+            if [ "$QUALITY" = "audio" ]; then
+              FMTARGS=(-f "bestaudio/best" -x --audio-format mp3 --audio-quality 0)
+            else
+              case "$QUALITY" in
+                1080) FMT="bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b" ;;
+                720)  FMT="bv*[height<=720]+ba/b[height<=720]/bv*+ba/b" ;;
+                480)  FMT="bv*[height<=480]+ba/b[height<=480]/bv*+ba/b" ;;
+                *)    FMT="bv*+ba/b" ;;
+              esac
+              FMTARGS=(-f "$FMT" --merge-output-format mp4)
+            fi
+            OUT=(-o "out/%(title).120B [%(id)s].%(ext)s")
+
+            echo "== Attempt 1: default =="
+            yt-dlp "${COMMON[@]}" "${FMTARGS[@]}" "${OUT[@]}" "$URL" && return 0
+            rm -f out/*.part out/*.ytdl
+
+            echo "== Attempt 2: impersonate chrome =="
+            yt-dlp "${COMMON[@]}" --impersonate chrome "${FMTARGS[@]}" "${OUT[@]}" "$URL" && return 0
+            rm -f out/*.part out/*.ytdl
+
+            echo "== Attempt 3: other YouTube clients =="
+            yt-dlp "${COMMON[@]}" --impersonate chrome \
+              --extractor-args "youtube:player_client=default,tv,web_safari,mweb" \
+              "${FMTARGS[@]}" "${OUT[@]}" "$URL" && return 0
+            rm -f out/*.part out/*.ytdl
+
+            echo "== Attempt 4: simplest single file =="
+            yt-dlp "${COMMON[@]}" --impersonate chrome -f "b/best" "${OUT[@]}" "$URL" && return 0
+            return 1
+          }
+
+          # ---- פונקציה: הורדת קובץ ישיר עם curl ----
+          curl_download () {
+            UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+            ( cd out && curl -fL --retry 5 --retry-delay 3 --retry-all-errors \
+                -A "$UA" -O -J "$URL" ) && return 0
+            rm -f out/*
+            ( cd out && curl -fL --retry 5 --retry-delay 3 --retry-all-errors \
+                -A "$UA" -o "downloaded_file" "$URL" ) && return 0
+            rm -f out/*
+            return 1
+          }
+
+          if [ "$MODE" = "file" ]; then
+            curl_download && exit 0
+            echo "curl failed -> trying yt-dlp as fallback"
+            ytdlp_download && exit 0
           else
-            case "$QUALITY" in
-              1080) FMT="bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
-              720)  FMT="bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
-              480)  FMT="bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
-              *)    FMT="bestvideo+bestaudio/best" ;;
-            esac
-            MODE=(-f "$FMT" --merge-output-format mp4)
+            ytdlp_download && exit 0
+            echo "yt-dlp failed -> trying plain curl as fallback"
+            curl_download && exit 0
           fi
-
-          OUT=(-o "out/%(title)s.%(ext)s")
-
-          echo "== Attempt 1: default =="
-          if yt-dlp "${COMMON[@]}" "${MODE[@]}" "${OUT[@]}" "$URL"; then exit 0; fi
-
-          echo "== Attempt 2: impersonate chrome =="
-          if yt-dlp "${COMMON[@]}" --impersonate chrome "${MODE[@]}" "${OUT[@]}" "$URL"; then exit 0; fi
-
-          echo "== Attempt 3: simplest format =="
-          yt-dlp "${COMMON[@]}" --impersonate chrome -f "best" "${OUT[@]}" "$URL"
-
-      # ---------- FILE MODE (plain curl, no yt-dlp involved) ----------
-      - name: Download file
-        if: github.event.client_payload.mode == 'file'
-        env:
-          URL: ${{ github.event.client_payload.url }}
-        run: |
-          set -e
-          cd out
-          curl -L -O -J "$URL" || curl -L -o downloaded_file "$URL"
+          echo "::error::All download attempts failed"
+          exit 1
 
       - name: List result
-        run: ls -la out
+        run: |
+          rm -f out/*.part out/*.ytdl
+          ls -la out
+          if [ -z "$(ls -A out)" ]; then echo "::error::No file was downloaded"; exit 1; fi
 
-      # ---------- NEW: publish to the "downloads" branch (CORS-safe) ----------
-      # The dashboard reads these files via the git blobs API, which does
-      # send CORS headers, so no browser blocking. Works for files up to
-      # ~100MB. Larger files won't commit — use the artifact backup instead.
+      # ---------- פרסום לענף downloads (הדשבורד מוריד משם, בלי בעיות CORS) ----------
       - name: Publish to downloads branch
         env:
-          REQ: ${{ github.event.client_payload.request_id }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          # size guard: skip anything over 95MB (git blobs API limit is 100MB)
           if find out -type f -size +95M | grep -q .; then
-            echo "A file is larger than 95MB; skipping branch publish. Use the artifact backup."
+            echo "File larger than 95MB - skipping branch publish (artifact only)."
             exit 0
           fi
 
-          cp -r out /tmp/dl_out
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          PUB="$RUNNER_TEMP/pub"
 
-          if git ls-remote --exit-code origin downloads >/dev/null 2>&1; then
-            git fetch origin downloads
-            git checkout -B downloads origin/downloads
-          else
-            git checkout --orphan downloads
-            git rm -rf . >/dev/null 2>&1 || true
-          fi
+          for attempt in 1 2 3 4 5; do
+            rm -rf "$PUB"
+            if git ls-remote --exit-code --heads "$REMOTE" downloads >/dev/null 2>&1; then
+              git clone --quiet --depth 1 --branch downloads "$REMOTE" "$PUB"
+            else
+              mkdir -p "$PUB" && cd "$PUB" && git init -q && git checkout -q -b downloads \
+                && git remote add origin "$REMOTE" && cd - >/dev/null
+            fi
+            cd "$PUB"
+            # ניקוי אוטומטי: מוחק תיקיות ישנות מיממה כדי שהענף לא יתנפח
+            NOW=$(date +%s)
+            for d in dl-*; do
+              [ -d "$d" ] || continue
+              TS=$(cat "$d/.ts" 2>/dev/null || echo 0)
+              if [ $((NOW - TS)) -gt 86400 ]; then git rm -rq "$d" || rm -rf "$d"; fi
+            done
 
-          rm -rf "dl-$REQ"
-          mkdir -p "dl-$REQ"
-          cp /tmp/dl_out/* "dl-$REQ/"
-          git add "dl-$REQ"
-          git commit -m "download $REQ" || echo "nothing to commit"
-          git push origin downloads
+            rm -rf "dl-$REQ" && mkdir -p "dl-$REQ"
+            cp "$GITHUB_WORKSPACE"/out/* "dl-$REQ/"
+            echo "$NOW" > "dl-$REQ/.ts"
+            git add -A
+            git commit -qm "download $REQ" || true
+            if git push -q origin downloads; then echo "published"; exit 0; fi
+            cd "$GITHUB_WORKSPACE"
+            echo "push conflict, retrying ($attempt)..."; sleep $((attempt * 3))
+          done
+          echo "::warning::Could not publish to branch; artifact is still available."
 
-      # ---------- backup: keep the artifact too (for the GitHub-website link) ----------
+      # ---------- גיבוי: artifact (לקבצים גדולים מ-95MB) ----------
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: result-${{ github.event.client_payload.request_id }}
           path: out/*
           retention-days: 1
           if-no-files-found: error
+          compression-level: 0
