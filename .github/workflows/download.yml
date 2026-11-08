@@ -19,7 +19,7 @@ jobs:
   fetch:
     # גרסה קבועה במקום ubuntu-latest, כדי שהמעבר לאובונטו 26 לא ישבור כלום
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 150
     env:
       MODE: ${{ github.event.client_payload.mode }}
       URL: ${{ github.event.client_payload.url }}
@@ -136,56 +136,108 @@ jobs:
           ls -la out
           if [ -z "$(ls -A out)" ]; then echo "::error::No file was downloaded"; exit 1; fi
 
-      # ---------- פרסום לענף downloads (הדשבורד מוריד משם, בלי בעיות CORS) ----------
-      - name: Publish to downloads branch
+      # ---------- ניקוי ענפי הורדה ישנים (מעל יממה) ----------
+      - name: Clean old download branches
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CUTOFF=$(date -d '-1 day' +%s)
+          gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/dl-" --paginate \
+            --jq '.[] | .ref + " " + .object.sha' | while read -r REF SHA; do
+            D=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$SHA" --jq .committer.date)
+            if [ "$(date -d "$D" +%s)" -lt "$CUTOFF" ]; then
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/$REF" >/dev/null && echo "deleted $REF"
+            fi
+          done
+          # הענף המשותף מהגרסה הקודמת כבר לא בשימוש
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/downloads" >/dev/null 2>&1 || true
+
+      # ---------- פרסום לענף פרטי dl-<id>, קבצים גדולים מחולקים לחלקים של 90MB ----------
+      # הדשבורד מוריד את החלקים דרך ה-API (בלי בעיות CORS) ומחבר אותם חזרה לקובץ אחד.
+      - name: Publish to download branch
+        id: pub
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          if find out -type f -size +95M | grep -q .; then
-            echo "File larger than 95MB - skipping branch publish (artifact only)."
-            exit 0
-          fi
-
-          git config --global user.name  "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          BR="dl-$REQ"
           PUB="$RUNNER_TEMP/pub"
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          rm -rf "$PUB" && mkdir -p "$PUB"
 
-          for attempt in 1 2 3 4 5; do
-            rm -rf "$PUB"
-            if git ls-remote --exit-code --heads "$REMOTE" downloads >/dev/null 2>&1; then
-              git clone --quiet --depth 1 --branch downloads "$REMOTE" "$PUB"
-            else
-              mkdir -p "$PUB" && cd "$PUB" && git init -q && git checkout -q -b downloads \
-                && git remote add origin "$REMOTE" && cd - >/dev/null
-            fi
-            cd "$PUB"
-            # ניקוי אוטומטי: מוחק תיקיות ישנות מיממה כדי שהענף לא יתנפח
-            NOW=$(date +%s)
-            for d in dl-*; do
-              [ -d "$d" ] || continue
-              TS=$(cat "$d/.ts" 2>/dev/null || echo 0)
-              if [ $((NOW - TS)) -gt 86400 ]; then git rm -rq "$d" || rm -rf "$d"; fi
+          # חלוקה לחלקים + manifest.json עם השמות המקוריים
+          python3 - "$GITHUB_WORKSPACE/out" "$PUB" << 'PY'
+          import os, sys, json
+          src, dst = sys.argv[1], sys.argv[2]
+          CHUNK = 90 * 1024 * 1024
+          files = []
+          for i, name in enumerate(sorted(os.listdir(src))):
+              path = os.path.join(src, name)
+              if not os.path.isfile(path):
+                  continue
+              size = os.path.getsize(path)
+              parts = []
+              with open(path, 'rb') as f:
+                  n = 0
+                  while True:
+                      buf = f.read(CHUNK)
+                      if not buf and n > 0:
+                          break
+                      pname = f"{i:03d}_{n:04d}.part"
+                      with open(os.path.join(dst, pname), 'wb') as o:
+                          o.write(buf)
+                      parts.append(pname)
+                      n += 1
+                      if not buf:
+                          break
+              os.remove(path)  # חוסך מקום בדיסק של ה-runner
+              files.append({"name": name, "size": size, "parts": parts})
+          json.dump({"files": files}, open(os.path.join(dst, "manifest.json"), "w"), ensure_ascii=False)
+          print(json.dumps(files, ensure_ascii=False, indent=1))
+          PY
+
+          cd "$PUB"
+          git init -q
+          git checkout -q -b "$BR"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 1048576000
+          git remote add origin "$REMOTE"
+
+          FIRST=1
+          push_batch () {
+            git commit -qm "$BR" || return 0
+            for t in 1 2 3 4 5; do
+              if [ "$FIRST" = 1 ]; then git push -q -f origin "$BR" && { FIRST=0; return 0; }
+              else git push -q origin "$BR" && return 0; fi
+              echo "push failed, retry $t"; sleep $((t * 5))
             done
+            return 1
+          }
 
-            rm -rf "dl-$REQ" && mkdir -p "dl-$REQ"
-            cp "$GITHUB_WORKSPACE"/out/* "dl-$REQ/"
-            echo "$NOW" > "dl-$REQ/.ts"
-            git add -A
-            git commit -qm "download $REQ" || true
-            if git push -q origin downloads; then echo "published"; exit 0; fi
-            cd "$GITHUB_WORKSPACE"
-            echo "push conflict, retrying ($attempt)..."; sleep $((attempt * 3))
+          # דוחף במנות של ~900MB (GitHub מגביל דחיפה בודדת ל-2GB)
+          SIZE=0
+          for f in $(ls *.part | sort); do
+            git add "$f"
+            SIZE=$((SIZE + $(stat -c%s "$f")))
+            if [ "$SIZE" -ge 943718400 ]; then push_batch; SIZE=0; fi
           done
-          echo "::warning::Could not publish to branch; artifact is still available."
+          # ה-manifest נכנס אחרון = סימן שהכל מוכן
+          git add manifest.json
+          push_batch
+          echo "published to branch $BR"
 
-      # ---------- גיבוי: artifact (לקבצים גדולים מ-95MB) ----------
-      - name: Upload artifact
+      # ---------- גיבוי: artifact, רק אם הפרסום לענף נכשל ----------
+      - name: Upload artifact (fallback)
+        if: steps.pub.outcome != 'success'
         uses: actions/upload-artifact@v5
         with:
           name: result-${{ github.event.client_payload.request_id }}
-          path: out/*
+          path: |
+            out/*
+            ${{ runner.temp }}/pub/*
           retention-days: 1
           if-no-files-found: error
           compression-level: 0
