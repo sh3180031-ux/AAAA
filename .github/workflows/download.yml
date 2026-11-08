@@ -114,6 +114,20 @@ jobs:
             return 1
           }
 
+          # ---- Google Drive: הורדה ישירה דרך הקישור הרשמי של גוגל ----
+          if echo "$URL" | grep -qE '(drive|docs)\.google\.com'; then
+            ID=$(echo "$URL" | sed -nE 's#.*[?&]id=([A-Za-z0-9_-]+).*#\1#p')
+            [ -z "$ID" ] && ID=$(echo "$URL" | sed -nE 's#.*/d/([A-Za-z0-9_-]+).*#\1#p')
+            if [ -n "$ID" ]; then
+              echo "== Google Drive file id: $ID =="
+              DURL="https://drive.usercontent.google.com/download?id=${ID}&export=download&confirm=t"
+              ( cd out && curl -fL --retry 5 --retry-delay 3 --retry-all-errors -O -J "$DURL" ) && exit 0
+              rm -f out/*
+              echo "::error::Google Drive refused the file (404/403). Make sure the file is shared as 'Anyone with the link'."
+              exit 1
+            fi
+          fi
+
           if [ "$MODE" = "file" ]; then
             curl_download && exit 0
             echo "curl failed -> trying yt-dlp as fallback"
