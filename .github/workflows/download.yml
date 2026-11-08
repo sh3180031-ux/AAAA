@@ -6,7 +6,7 @@ on:
     types: [download]
 
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 # מכריח את כל ה-actions לרוץ על Node 24 (מעלים את אזהרת Node 20)
@@ -136,9 +136,97 @@ jobs:
           ls -la out
           if [ -z "$(ls -A out)" ]; then echo "::error::No file was downloaded"; exit 1; fi
 
-      # ---------- העלאה כ-artifact (הכי מהיר; בלי דחיסה) ----------
+      # ---------- ניקוי ענפי הורדה ישנים (מעל יממה) ----------
+      - name: Clean old download branches
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CUTOFF=$(date -d '-1 day' +%s)
+          gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/dl-" --paginate \
+            --jq '.[] | .ref + " " + .object.sha' | while read -r REF SHA; do
+            D=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$SHA" --jq .committer.date)
+            if [ "$(date -d "$D" +%s)" -lt "$CUTOFF" ]; then
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/$REF" >/dev/null && echo "deleted $REF"
+            fi
+          done
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/downloads" >/dev/null 2>&1 || true
+
+      # ---------- פרסום לענף פרטי dl-<id> בחלקים של 25MB ----------
+      # api.github.com הוא השרת היחיד של GitHub שהדפדפן מרשה לקרוא ממנו (CORS),
+      # לכן הדשבורד מוריד את החלקים משם במקביל ומחבר אותם לקובץ אחד עם השם המקורי.
+      - name: Publish to download branch
+        id: pub
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          BR="dl-$REQ"
+          PUB="$RUNNER_TEMP/pub"
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          rm -rf "$PUB" && mkdir -p "$PUB"
+
+          python3 - "$GITHUB_WORKSPACE/out" "$PUB" << 'PY'
+          import os, sys, json
+          src, dst = sys.argv[1], sys.argv[2]
+          CHUNK = 25 * 1024 * 1024
+          files = []
+          for i, name in enumerate(sorted(os.listdir(src))):
+              path = os.path.join(src, name)
+              if not os.path.isfile(path):
+                  continue
+              size = os.path.getsize(path)
+              parts = []
+              with open(path, 'rb') as f:
+                  n = 0
+                  while True:
+                      buf = f.read(CHUNK)
+                      if not buf and n > 0:
+                          break
+                      pname = f"{i:03d}_{n:04d}.part"
+                      with open(os.path.join(dst, pname), 'wb') as o:
+                          o.write(buf)
+                      parts.append(pname)
+                      n += 1
+                      if not buf:
+                          break
+              files.append({"name": name, "size": size, "parts": parts})
+          json.dump({"files": files}, open(os.path.join(dst, "manifest.json"), "w"), ensure_ascii=False)
+          print(json.dumps(files, ensure_ascii=False))
+          PY
+
+          cd "$PUB"
+          git init -q
+          git checkout -q -b "$BR"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 1048576000
+          git remote add origin "$REMOTE"
+
+          FIRST=1
+          push_batch () {
+            git commit -qm "$BR" || return 0
+            for t in 1 2 3 4 5; do
+              if [ "$FIRST" = 1 ]; then git push -q -f origin "$BR" && { FIRST=0; return 0; }
+              else git push -q origin "$BR" && return 0; fi
+              echo "push failed, retry $t"; sleep $((t * 5))
+            done
+            return 1
+          }
+          SIZE=0
+          for f in $(ls *.part | sort); do
+            git add "$f"
+            SIZE=$((SIZE + $(stat -c%s "$f")))
+            if [ "$SIZE" -ge 838860800 ]; then push_batch; SIZE=0; fi
+          done
+          git add manifest.json
+          push_batch
+          echo "published to branch $BR"
+
+      # ---------- גיבוי: artifact (לכפתור "הורד ישירות מ-GitHub") ----------
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: result-${{ github.event.client_payload.request_id }}
           path: out/*
